@@ -27,6 +27,7 @@ cdef extern from "turbojpeg.h":
     int tjGreenOffset[12]
     int tjBlueOffset[12]
     int tjPixelSize[12]
+    int TJFLAG_NOREALLOC
     cdef enum TJCS:
         TJCS_RGB
         TJCS_YCbCr

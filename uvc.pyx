@@ -98,18 +98,22 @@ cdef class Frame:
     Previously converted formats are still valid.
     '''
 
-    cdef turbojpeg.tjhandle tj_context
+    cdef turbojpeg.tjhandle tj_context, tj_compressor
     cdef uvc.uvc_frame * _uvc_frame
-    cdef unsigned char[:] _bgr_buffer, _gray_buffer,_yuv_buffer #we use numpy for memory management.
-    cdef bint _yuv_converted, _bgr_converted
+    cdef unsigned char[:] _bgr_buffer, _gray_buffer, _yuv_buffer, _compressed_jpeg #we use numpy for memory management.
+    cdef bint _yuv_converted, _bgr_converted, _compressed
     cdef public double timestamp
     cdef public yuv_subsampling
     cdef bint owns_uvc_frame
+    cdef int _jpeg_qual
 
     def __cinit__(self):
         self._yuv_converted = False
         self._bgr_converted = False
+        self._compressed = False
         self.tj_context = NULL
+        self.tj_compressor = NULL
+        self._jpeg_qual = 30
 
     def __init__(self):
         pass
@@ -291,9 +295,40 @@ cdef class Frame:
         self.yuv_subsampling = jpegSubsamp
         self._yuv_converted = True
 
+    property compressed_jpeg:
+        def __get__(self):
+            cdef long unsigned int buf_size
+            cdef unsigned char* buf_addr
+
+            if self._compressed is False:
+                if self._yuv_converted is False:
+                    self.jpeg2yuv()
+                buf_size = turbojpeg.tjBufSize(self.width, self.height, turbojpeg.TJSAMP_422)
+                self._compressed_jpeg = np.empty(buf_size, dtype=np.uint8)
+                buf_addr = &self._compressed_jpeg[0]
+                result = turbojpeg.tjCompressFromYUV(
+                    self.tj_compressor,
+                    &self._yuv_buffer[0],
+                    self.width,
+                    4,
+                    self.height,
+                    turbojpeg.TJSAMP_422,
+                    &buf_addr,
+                    &buf_size,
+                    self._jpeg_qual,
+                    turbojpeg.TJFLAG_NOREALLOC)
+                if result == -1:
+                    logger.warning('Turbojpeg compressed_jpeg: %s', turbojpeg.tjGetErrorStr())
+                self._compressed_jpeg = self._compressed_jpeg[:buf_size]
+                self._compressed = True
+
+            cdef np.uint8_t[::1] view = <np.uint8_t[:self._compressed_jpeg.shape[0]]>&self._compressed_jpeg[0]
+            return view
+
     def clear_caches(self):
         self._bgr_converted = False
         self._yuv_converted = False
+        self._compressed = False
 
 
 
@@ -416,7 +451,7 @@ cdef class Capture:
     All controls are exposed and can be enumerated using the controls list.
     """
 
-    cdef turbojpeg.tjhandle tj_context
+    cdef turbojpeg.tjhandle tj_context, tj_compressor
 
     cdef uvc.uvc_context_t *ctx
     cdef uvc.uvc_device_t *dev
@@ -425,6 +460,7 @@ cdef class Capture:
     cdef bint _stream_on,_configured
     cdef uvc.uvc_stream_handle_t *strmh
     cdef float _bandwidth_factor
+    cdef int _jpeg_qual
 
     cdef tuple _active_mode
     cdef list _available_modes
@@ -437,6 +473,7 @@ cdef class Capture:
         self.devh = NULL
         self._stream_on = 0
         self._configured = 0
+        self._jpeg_qual = 30
         self.strmh = NULL
         self._available_modes = []
         self._active_mode = None,None,None
@@ -448,6 +485,7 @@ cdef class Capture:
 
         #setup for jpeg converter
         self.tj_context = turbojpeg.tjInitDecompress()
+        self.tj_compressor = turbojpeg.tjInitCompress()
 
         if uvc.uvc_init(&self.ctx, NULL) != uvc.UVC_SUCCESS:
             raise InitError('Could not init libuvc')
@@ -601,6 +639,8 @@ cdef class Capture:
 
         cdef Frame out_frame = Frame()
         out_frame.tj_context = self.tj_context
+        out_frame.tj_compressor = self.tj_compressor
+        out_frame._jpeg_qual = self._jpeg_qual
         out_frame.attach_uvcframe(uvc_frame = uvc_frame,copy=True)
         out_frame.timestamp = uvc_frame.capture_time.tv_sec + <double>uvc_frame.capture_time.tv_usec * 1e-6
         return out_frame
@@ -692,7 +732,9 @@ cdef class Capture:
             uvc.uvc_exit(self.ctx)
             self.ctx = NULL
             turbojpeg.tjDestroy(self.tj_context)
+            turbojpeg.tjDestroy(self.tj_compressor)
             self.tj_context = NULL
+            self.tj_compressor = NULL
 
     def __dealloc__(self):
         self.close()
@@ -765,6 +807,14 @@ cdef class Capture:
                 self._bandwidth_factor = bandwidth_factor
                 if self._stream_on:
                     self._stop()
+
+    property quality:
+        def __get__(self):
+            return self._jpeg_qual
+
+        def __set__(self, val):
+            self._jpeg_qual = val
+
 
 cdef void on_status_update(uvc.uvc_status_class status_class,
                         int event,
